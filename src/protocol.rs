@@ -1,63 +1,72 @@
-use bitcoin::hashes::sha256d;
 // https://en.bitcoin.it/wiki/Protocol_documentation
-// TODO: I've decided to focus on version == 60002, support for other versions is missing
+use bitcoin::hashes::sha256d;
+use bitcoin_hashes::sha256;
+use bitcoin_hashes::Hash;
 use bytes::BytesMut;
-use std::convert::TryInto;
+use rand::Rng;
+use std::net::Ipv6Addr;
+use std::{convert::TryInto, time::SystemTime};
 use tokio_util::codec::{Decoder, Encoder};
 
 #[derive(PartialEq, Debug)]
-struct BaseFrame {
-    magic: u32,
-    command: String,
-    length: u32,
-    checksum: u32,
-    internal_frame: InternalFrame,
+pub struct BaseFrame {
+    pub magic: u32,
+    pub command: String,
+    pub internal_frame: InternalFrame,
 }
 
 #[derive(PartialEq, Debug)]
-enum InternalFrame {
+pub enum InternalFrame {
     Version(VersionFrame),
     VerAck(VerAckFrame),
 }
 
 #[derive(PartialEq, Debug)]
-struct VersionFrame {
-    version: i32,
-    services: u64,
-    timestamp: i64, // TODO: Consider converting to a proper structure
-    addr_recv: NetAddrVersion,
-    addr_from: NetAddrVersion,
-    nonce: u64,
-    user_agent: String,
-    start_height: i32,
-    // relay: bool,
+pub struct VersionFrame {
+    pub version: i32,
+    pub services: u64,
+    pub timestamp: i64, // TODO: Consider converting to a proper structure
+    pub addr_recv: NetAddr,
+    pub addr_from: NetAddr, // TODO: Remove. From docs - Field can be ignored. This used to be the network address of the node emitting this message, but most P2P implementations send 26 dummy bytes. The "services" field of the address would also be redundant with the second field of the version message.
+    pub nonce: u64,
+    pub user_agent: String,
+    pub start_height: i32,
+    pub relay: bool,
 }
 
 #[derive(PartialEq, Debug)]
-struct NetAddrVersion {
-    services: u64,
-    ip_v6_v4: [u8; 16],
-    port: u16,
+pub struct NetAddr {
+    pub services: u64,
+    pub ip: Ipv6Addr,
+    pub port: u16,
 }
 
-impl NetAddrVersion {
+impl NetAddr {
+    fn new(ip: Ipv6Addr, port: u16) -> NetAddr {
+        NetAddr {
+            services: 0,
+            ip,
+            port,
+        }
+    }
+
     fn encode(&self) -> Vec<u8> {
         let mut dst = Vec::with_capacity(26);
         dst.extend_from_slice(&self.services.to_le_bytes());
-        dst.extend_from_slice(&self.ip_v6_v4);
-        dst.extend_from_slice(&self.port.to_le_bytes());
+        dst.extend_from_slice(&self.ip.octets()[..]);
+        dst.extend_from_slice(&self.port.to_be_bytes());
 
         dst
     }
 
-    fn decode(src: &[u8; 26]) -> Result<NetAddrVersion, std::io::Error> {
+    fn decode(src: &[u8; 26]) -> Result<NetAddr, std::io::Error> {
         let services = u64::from_le_bytes(src[0..8].try_into().unwrap());
-        let ip_v6_v4: [u8; 16] = src[8..24].try_into().unwrap();
-        let port = u16::from_le_bytes(src[24..26].try_into().unwrap());
+        let ip_v6 = Ipv6Addr::from(<&[u8] as TryInto<[u8; 16]>>::try_into(&src[8..24]).unwrap());
+        let port = u16::from_be_bytes(src[24..26].try_into().unwrap());
 
-        Ok(NetAddrVersion {
+        Ok(NetAddr {
             services,
-            ip_v6_v4,
+            ip: ip_v6,
             port,
         })
     }
@@ -76,7 +85,7 @@ impl VersionFrame {
         dst.extend_from_slice(&user_agent_len.to_le_bytes());
         dst.extend_from_slice(&self.user_agent.as_bytes());
         dst.extend_from_slice(&self.start_height.to_le_bytes());
-        // dst.extend_from_slice(&self.relay.to_le_bytes());
+        dst.push(if self.relay { 0x01 } else { 0x00 });
 
         dst
     }
@@ -86,15 +95,14 @@ impl VersionFrame {
         if src.len() < struct_min_size {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Invalid size"),
+                format!("Invalid size. Got size: {}", src.len()),
             ));
         }
         let version = i32::from_le_bytes(src[0..4].try_into().unwrap());
         let services = u64::from_le_bytes(src[4..12].try_into().unwrap());
         let timestamp = i64::from_le_bytes(src[12..20].try_into().unwrap());
-        let addr_recv = NetAddrVersion::decode(src[20..46].try_into().unwrap()).unwrap();
-        // TODO: All below only in version ≥ 106
-        let addr_from = NetAddrVersion::decode(src[46..72].try_into().unwrap()).unwrap();
+        let addr_recv = NetAddr::decode(src[20..46].try_into().unwrap()).unwrap();
+        let addr_from = NetAddr::decode(src[46..72].try_into().unwrap()).unwrap();
         let nonce = u64::from_le_bytes(src[72..80].try_into().unwrap());
         let user_agent_size = u8::from_le_bytes(src[80..81].try_into().unwrap()) as usize;
         let user_agent = if user_agent_size == 0x00 {
@@ -107,12 +115,11 @@ impl VersionFrame {
                 .try_into()
                 .unwrap(),
         );
-        // TODO: relay only in version ≥ 70001
-        // let relay = u8::from_le_bytes(
-        //     src[83 + user_agent_size..83 + user_agent_size + 1]
-        //         .try_into()
-        //         .unwrap(),
-        // ) == 0x00;
+        let relay = u8::from_le_bytes(
+            src[85 + user_agent_size..85 + user_agent_size + 1]
+                .try_into()
+                .unwrap(),
+        ) == 0x00;
 
         Ok(VersionFrame {
             version,
@@ -123,13 +130,13 @@ impl VersionFrame {
             nonce,
             user_agent,
             start_height,
-            // relay,
+            relay,
         })
     }
 }
 
 #[derive(PartialEq, Debug)]
-struct VerAckFrame {}
+pub struct VerAckFrame {}
 
 impl VerAckFrame {
     fn encode(&self) -> Vec<u8> {
@@ -148,7 +155,8 @@ impl VerAckFrame {
     }
 }
 
-struct Codec {}
+#[derive(Default)]
+pub struct Codec {}
 
 impl Encoder<BaseFrame> for Codec {
     type Error = std::io::Error;
@@ -177,40 +185,50 @@ impl Decoder for Codec {
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         const MIN_LENGTH: usize = 24;
         if src.len() < MIN_LENGTH {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Invalid size"),
-            ));
+            src.reserve(MIN_LENGTH - src.len());
+            return Ok(None);
         }
         let magic = u32::from_le_bytes(src[0..4].try_into().unwrap());
+        let length = u32::from_le_bytes(src[16..20].try_into().unwrap());
+        if src.len() < length as usize {
+            src.reserve(MIN_LENGTH + length as usize - src.len());
+            return Ok(None);
+        }
+        let src = src.split_to(MIN_LENGTH + length as usize);
         let command = bytes_to_str(&src[4..16]);
 
-        let length = u32::from_le_bytes(src[16..20].try_into().unwrap());
-        if MIN_LENGTH + length as usize != src.len() {
+        if (MIN_LENGTH + length as usize) < src.len() {
+            return Ok(None);
+        }
+        let checksum = &src[20..24];
+        let internal_payload = &src[24..24 + length as usize];
+        if calculate_checksum(internal_payload) != checksum {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Invalid size"),
+                format!("Invalid checksum"),
             ));
         }
-        let checksum = u32::from_le_bytes(src[20..24].try_into().unwrap());
-        let internal_payload = &src[24..24 + length as usize];
-        println!("Command: {command}");
-        // TODO: check if checksum from received message is the same as calculated one
+        println!("Received command: {command}");
         let internal_frame = match command {
             "version" => InternalFrame::Version(
                 VersionFrame::decode(&mut BytesMut::from(internal_payload)).unwrap(),
             ),
+
             "verack" => InternalFrame::VerAck(
                 VerAckFrame::decode(&mut BytesMut::from(internal_payload)).unwrap(),
             ),
-            _ => unimplemented!(),
+
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Command not supported"),
+                ))
+            }
         };
 
         Ok(Some(BaseFrame {
             magic,
             command: command.to_string(),
-            length,
-            checksum,
             internal_frame,
         }))
     }
@@ -234,15 +252,41 @@ fn str_to_padded_bytes(data: &str) -> Vec<u8> {
 }
 
 fn calculate_checksum(data: &[u8]) -> [u8; 4] {
-    use bitcoin_hashes::sha256;
-    use bitcoin_hashes::Hash;
-
     let mut reader: &[u8] = data;
     let mut engine = sha256::HashEngine::default();
     std::io::copy(&mut reader, &mut engine).unwrap();
     let hash = sha256d::Hash::from_engine(engine);
 
     [hash[0], hash[1], hash[2], hash[3]]
+}
+
+pub fn version_frame(ip: Ipv6Addr, port: u16, user_agent: String) -> BaseFrame {
+    BaseFrame {
+        magic: 0xd9b4bef9,
+        command: "version".to_string(),
+        internal_frame: InternalFrame::Version(VersionFrame {
+            version: 70001,
+            services: 0,
+            timestamp: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
+            addr_recv: NetAddr::new(ip, port),
+            addr_from: NetAddr::new(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0), 0),
+            nonce: rand::thread_rng().gen::<u64>(),
+            user_agent,
+            start_height: 0,
+            relay: false,
+        }),
+    }
+}
+
+pub fn verack_frame() -> BaseFrame {
+    BaseFrame {
+        magic: 0xd9b4bef9,
+        command: "verack".to_string(),
+        internal_frame: InternalFrame::VerAck(VerAckFrame {}),
+    }
 }
 
 #[cfg(test)]
@@ -262,7 +306,7 @@ mod test {
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3b, 0x2e,
                 0xb3, 0x5d, 0x8c, 0xe6, 0x17, 0x65, 0x0f, 0x2f, 0x53, 0x61, 0x74, 0x6f, 0x73, 0x68,
-                0x69, 0x3a, 0x30, 0x2e, 0x37, 0x2e, 0x32, 0x2f, 0xc0, 0x3e, 0x03, 0x00,
+                0x69, 0x3a, 0x30, 0x2e, 0x37, 0x2e, 0x32, 0x2f, 0xc0, 0x3e, 0x03, 0x00, 0x00,
             ][..],
         );
         let mut codec = Codec {};
@@ -272,36 +316,24 @@ mod test {
             BaseFrame {
                 magic: 0xd9b4bef9,
                 command: "version".to_string(),
-                length: 100,
-                checksum: 0x32498d35,
                 internal_frame: InternalFrame::Version(VersionFrame {
                     version: 60002,
                     services: 1,
                     timestamp: 1355854353,
-                    addr_recv: NetAddrVersion {
+                    addr_recv: NetAddr {
                         services: 1,
-                        ip_v6_v4: vec![
-                            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff,
-                            0x00, 0x00, 0x00, 0x00,
-                        ]
-                        .try_into()
-                        .unwrap(),
+                        ip: "::ffff:0.0.0.0".parse().unwrap(),
                         port: 0
                     },
-                    addr_from: NetAddrVersion {
+                    addr_from: NetAddr {
                         services: 0,
-                        ip_v6_v4: vec![
-                            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff,
-                            0x00, 0x00, 0x00, 0x00,
-                        ]
-                        .try_into()
-                        .unwrap(),
+                        ip: "::ffff:0.0.0.0".parse().unwrap(),
                         port: 0
                     },
                     nonce: 7284544412836900411,
                     user_agent: "/Satoshi:0.7.2/".to_string(),
                     start_height: 212672,
-                    // relay: false,
+                    relay: false,
                 })
             }
         );
@@ -322,8 +354,6 @@ mod test {
             BaseFrame {
                 magic: 0xd9b4bef9,
                 command: "verack".to_string(),
-                length: 0,
-                checksum: 0xe2e0f65d,
                 internal_frame: InternalFrame::VerAck(VerAckFrame {})
             }
         );
@@ -338,36 +368,24 @@ mod test {
                 BaseFrame {
                     magic: 0xd9b4bef9,
                     command: "version".to_string(),
-                    length: 100,
-                    checksum: 0x32498d35,
                     internal_frame: InternalFrame::Version(VersionFrame {
                         version: 60002,
                         services: 1,
                         timestamp: 1355854353,
-                        addr_recv: NetAddrVersion {
+                        addr_recv: NetAddr {
                             services: 1,
-                            ip_v6_v4: vec![
-                                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff,
-                                0xff, 0x00, 0x00, 0x00, 0x00,
-                            ]
-                            .try_into()
-                            .unwrap(),
+                            ip: "::ffff:0.0.0.0".parse().unwrap(),
                             port: 0,
                         },
-                        addr_from: NetAddrVersion {
+                        addr_from: NetAddr {
                             services: 0,
-                            ip_v6_v4: vec![
-                                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff,
-                                0xff, 0x00, 0x00, 0x00, 0x00,
-                            ]
-                            .try_into()
-                            .unwrap(),
+                            ip: "::ffff:0.0.0.0".parse().unwrap(),
                             port: 0,
                         },
                         nonce: 7284544412836900411,
                         user_agent: "/Satoshi:0.7.2/".to_string(),
                         start_height: 212672,
-                        // relay: false,
+                        relay: false,
                     }),
                 },
                 &mut encoded_frame,
@@ -383,7 +401,7 @@ mod test {
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3b, 0x2e,
                 0xb3, 0x5d, 0x8c, 0xe6, 0x17, 0x65, 0x0f, 0x2f, 0x53, 0x61, 0x74, 0x6f, 0x73, 0x68,
-                0x69, 0x3a, 0x30, 0x2e, 0x37, 0x2e, 0x32, 0x2f, 0xc0, 0x3e, 0x03, 0x00,
+                0x69, 0x3a, 0x30, 0x2e, 0x37, 0x2e, 0x32, 0x2f, 0xc0, 0x3e, 0x03, 0x00, 0x00,
             ][..],
         );
         assert_eq!(hex::encode(expected_frame), hex::encode(encoded_frame));
@@ -398,8 +416,6 @@ mod test {
                 BaseFrame {
                     magic: 0xd9b4bef9,
                     command: "verack".to_string(),
-                    length: 0,
-                    checksum: 0xe2e0f65d,
                     internal_frame: InternalFrame::VerAck(VerAckFrame {}),
                 },
                 &mut encoded_frame,
