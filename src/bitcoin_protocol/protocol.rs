@@ -1,4 +1,5 @@
 // https://en.bitcoin.it/wiki/Protocol_documentation
+use anyhow::Result;
 use bitcoin::hashes::sha256d;
 use bitcoin_hashes::sha256;
 use bitcoin_hashes::Hash;
@@ -119,7 +120,7 @@ impl VersionFrame {
             src[85 + user_agent_size..85 + user_agent_size + 1]
                 .try_into()
                 .unwrap(),
-        ) == 0x00;
+        ) != 0x00;
 
         Ok(VersionFrame {
             version,
@@ -163,7 +164,13 @@ impl Encoder<BaseFrame> for Codec {
 
     fn encode(&mut self, item: BaseFrame, dst: &mut BytesMut) -> Result<(), Self::Error> {
         dst.extend_from_slice(&item.magic.to_le_bytes());
-        dst.extend_from_slice(&str_to_padded_bytes(&item.command));
+        if item.command.len() >= 12 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Command too long"),
+            ));
+        }
+        dst.extend_from_slice(&str_to_padded_bytes(&item.command, 12));
         let payload_bytes = match item.internal_frame {
             InternalFrame::Version(frame) => frame.encode(),
             InternalFrame::VerAck(frame) => frame.encode(),
@@ -190,12 +197,20 @@ impl Decoder for Codec {
         }
         let magic = u32::from_le_bytes(src[0..4].try_into().unwrap());
         let length = u32::from_le_bytes(src[16..20].try_into().unwrap());
+        // TODO: see protocol limits when implementing more commands
+        let max_reasonable_frame_size = 1024;
+        if length > max_reasonable_frame_size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Specified frame length beyond reasonable limit"),
+            ));
+        }
         if src.len() < length as usize {
             src.reserve(MIN_LENGTH + length as usize - src.len());
             return Ok(None);
         }
         let src = src.split_to(MIN_LENGTH + length as usize);
-        let command = bytes_to_str(&src[4..16]);
+        let command = var_str_to_str(&src[4..16]);
 
         if (MIN_LENGTH + length as usize) < src.len() {
             return Ok(None);
@@ -218,11 +233,12 @@ impl Decoder for Codec {
                 VerAckFrame::decode(&mut BytesMut::from(internal_payload)).unwrap(),
             ),
 
+            // TODO: most of Bitcoin protocol commands are still not implemented
             _ => {
                 return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Command not supported"),
-                ))
+                    std::io::ErrorKind::Unsupported,
+                    format!("Unsupported command"),
+                ));
             }
         };
 
@@ -234,16 +250,14 @@ impl Decoder for Codec {
     }
 }
 
-fn bytes_to_str(data: &[u8]) -> &str {
-    let idx = data.iter().position(|ch| ch == &0x00).unwrap();
-    std::str::from_utf8(&data[..idx]).unwrap()
+fn var_str_to_str(data: &[u8]) -> &str {
+    let length = data.iter().position(|ch| ch == &0x00).unwrap();
+    std::str::from_utf8(&data[..length]).unwrap()
 }
 
-fn str_to_padded_bytes(data: &str) -> Vec<u8> {
-    if data.len() >= 12 {
-        panic!("Buffer too large");
-    }
-    let mut result = vec![0x00; 12];
+fn str_to_padded_bytes(data: &str, result_size: usize) -> Vec<u8> {
+    debug_assert!(data.len() <= 12);
+    let mut result = vec![0x00; result_size];
     for idx in 0..data.len() {
         result[idx] = data.as_bytes()[idx];
     }
@@ -299,7 +313,7 @@ mod test {
         let mut raw_frame = BytesMut::from(
             &[
                 0xf9, 0xbe, 0xb4, 0xd9, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x35, 0x8d, 0x49, 0x32, 0x62, 0xea, 0x00, 0x00,
+                0x00, 0x00, 0x65, 0x00, 0x00, 0x00, 0x8a, 0x80, 0x97, 0xa9, 0x62, 0xea, 0x00, 0x00,
                 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0xb2, 0xd0, 0x50, 0x00, 0x00,
                 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -394,7 +408,7 @@ mod test {
         let expected_frame = BytesMut::from(
             &[
                 0xf9, 0xbe, 0xb4, 0xd9, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x35, 0x8d, 0x49, 0x32, 0x62, 0xea, 0x00, 0x00,
+                0x00, 0x00, 0x65, 0x00, 0x00, 0x00, 0x8a, 0x80, 0x97, 0xa9, 0x62, 0xea, 0x00, 0x00,
                 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0xb2, 0xd0, 0x50, 0x00, 0x00,
                 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,

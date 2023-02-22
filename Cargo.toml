@@ -10,6 +10,8 @@ edition = "2021"
 # > The submitted code can not reuse entire preexisting handshake implementations like libp2p_noise/XX
 bitcoin = { version = "0.29.2", features = ["base64"] }
 bitcoin_hashes = "0.11.0"
+anyhow = "1.0.69"
+clap = { version = "4.1.6", features = ["derive"] }
 bytes = { version = "1.4.0", features = ["serde"] }
 futures-util = { version = "0.3.26", features = ["sink"] }
 tokio = { version = "1.25.0", default-features = false, features = [
